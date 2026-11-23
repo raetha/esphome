@@ -71,6 +71,9 @@ static constexpr uint32_t ATTACH_TIMEOUT_MS = 150000;
 // SIM status polls that fail before a warning, and between repeats of it
 static constexpr uint8_t SIM_WARN_AFTER = 10;
 static constexpr uint8_t SIM_WARN_EVERY = 60;
+// SIM status polls that fail at CFUN=4 before CFUN=1 is tried: some modems (SIM7070) power the SIM down at CFUN=0 and
+// only power it up again at CFUN=1
+static constexpr uint8_t SIM_FULL_POWER_AFTER = 5;
 static constexpr int RADIO_STATE_MINIMUM = 0;  // CFUN=0: radio off and the SIM powered down
 static constexpr int RADIO_STATE_RF_OFF = 4;   // CFUN=4: transmit and receive off, SIM still powered
 static constexpr uint8_t UART_EVENT_QUEUE_SIZE = 10;
@@ -745,8 +748,8 @@ ModemState ModemComponent::handle_state_enabling_() {
     ESP_LOGW(TAG, "Failed to set the APN with the SIM powered down; setting it after the SIM check");
   }
   // CFUN=4 powers the SIM up with the radio still off; a modem without it needs CFUN=1 to bring the SIM back
-  if (this->dce_->set_radio_state(RADIO_STATE_RF_OFF) != command_result::OK &&
-      this->dce_->set_radio_state(1) != command_result::OK) {
+  this->sim_rf_off_ = this->dce_->set_radio_state(RADIO_STATE_RF_OFF) == command_result::OK;
+  if (!this->sim_rf_off_ && this->dce_->set_radio_state(1) != command_result::OK) {
     ESP_LOGW(TAG, "Failed to power the SIM up");
     this->set_fault_(ModemFault::MODEM_FAULT_SETUP);
     this->modem_synced_ = true;  // it answers, so a disable() still tears it down
@@ -826,6 +829,15 @@ ModemState ModemComponent::handle_state_connecting_() {
       case SimResult::SIM_RESULT_READY:
         break;
       case SimResult::SIM_RESULT_RETRY:
+        // A SIM7070 accepts CFUN=4 but leaves the SIM powered down ("+CME ERROR: SIM failure") until CFUN=1; the
+        // radio goes on right after the SIM check anyway, so it only comes a few seconds early
+        if (this->sim_rf_off_ && this->sim_polls_ == SIM_FULL_POWER_AFTER) {
+          this->sim_rf_off_ = false;
+          ESP_LOGD(TAG, "SIM still not ready at CFUN=4; powering it up with CFUN=1");
+          if (this->dce_->set_radio_state(1) != command_result::OK) {
+            ESP_LOGW(TAG, "Failed to turn the radio on");
+          }
+        }
         return this->retry_(ModemState::MODEM_STATE_CONNECTING);
       case SimResult::SIM_RESULT_LOCKED:
         // A reboot would send nothing more, so the reboot timer is cancelled
